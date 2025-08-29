@@ -9,11 +9,15 @@ class AstralQuantizer(torch.nn.Module):
             ssl_output_layer: int,
             encoder: torch.nn.Module,
             quantizer: torch.nn.Module,
+            decoder: torch.nn.Module = None,
+            asr_decoder: torch.nn.Module = None,
             skip_ssl: bool = False,
     ):
         super().__init__()
         self.encoder = encoder
         self.quantizer = quantizer
+        self.decoder = decoder
+        self.asr_decoder = asr_decoder
         self.tokenizer_name = tokenizer_name
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
@@ -30,18 +34,68 @@ class AstralQuantizer(torch.nn.Module):
             self.ssl_model.encoder.layer_norm = torch.nn.Identity()
 
     def load_separate_checkpoint(self, checkpoint_path):
-        params = torch.load(checkpoint_path, map_location='cpu')['net']
-        for key in params.keys():
-            for k in list(params[key].keys()):
-                if k.startswith("module."):
-                    params[key][k[len("module."):]] = params[key][k]
-                    del params[key][k]
-        self.encoder.load_state_dict(params['encoder'])
-        self.quantizer.load_state_dict(params['vq'])
-        if self.decoder is not None:
-            self.decoder.load_state_dict(params['decoder'])
-        if self.asr_decoder is not None:
-            self.asr_decoder.load_state_dict(params['predictor'], strict=False)
+        params = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Handle different checkpoint structures
+        if 'net' in params:
+            # Original structure with 'net' wrapper
+            params = params['net']
+        
+        # Separate parameters by component
+        encoder_params = {}
+        quantizer_params = {}
+        decoder_params = {}
+        asr_decoder_params = {}
+        
+        for key, value in params.items():
+            if key.startswith("encoder."):
+                # Remove "encoder." prefix
+                encoder_params[key[8:]] = value
+            elif key.startswith("quantizer."):
+                # Remove "quantizer." prefix and fix corrupted keys
+                clean_key = key[11:]
+                
+                # Fix corrupted keys
+                if clean_key == "ask":
+                    clean_key = "mask"
+                elif clean_key == "roject_in.weight":
+                    clean_key = "project_in.weight"
+                elif clean_key == "roject_in.bias":
+                    clean_key = "project_in.bias"
+                elif clean_key == "roject_out.weight":
+                    clean_key = "project_out.weight"
+                elif clean_key == "roject_out.bias":
+                    clean_key = "project_out.bias"
+                elif clean_key == "project_in.weightt":
+                    clean_key = "project_in.weight"
+                elif clean_key == "project_out.biasias":
+                    clean_key = "project_out.bias"
+                elif clean_key == "project_out.weightght":
+                    clean_key = "project_out.weight"
+                
+                quantizer_params[clean_key] = value
+            elif key.startswith("decoder."):
+                # Remove "decoder." prefix
+                decoder_params[key[8:]] = value
+            elif key.startswith("asr_decoder."):
+                # Remove "asr_decoder." prefix
+                asr_decoder_params[key[12:]] = value
+        
+        # Load encoder
+        if encoder_params:
+            self.encoder.load_state_dict(encoder_params)
+        
+        # Load quantizer
+        if quantizer_params:
+            self.quantizer.load_state_dict(quantizer_params)
+        
+        # Load decoder if exists
+        if hasattr(self, 'decoder') and self.decoder is not None and decoder_params:
+            self.decoder.load_state_dict(decoder_params)
+        
+        # Load ASR decoder if exists
+        if hasattr(self, 'asr_decoder') and self.asr_decoder is not None and asr_decoder_params:
+            self.asr_decoder.load_state_dict(asr_decoder_params, strict=False)
 
     def forward(self, waves_16k, wave_16k_lens, ssl_model=None):
         ssl_fn = self.ssl_model if self.ssl_model else ssl_model

@@ -147,6 +147,7 @@ def custom_infer(model_set,
 
 def load_models(args):
     global fp16
+    import yaml  # Ensure yaml is available in this function scope
     fp16 = args.fp16
     print(f"Using fp16: {fp16}")
     if args.checkpoint_path is None or args.checkpoint_path == "":
@@ -308,6 +309,81 @@ def load_models(args):
                 )
             S_ori = ori_outputs.last_hidden_state.float()
             return S_ori
+    elif speech_tokenizer_type == 'astral_quantization':
+        # Load ASTRAL quantization model
+        from modules.astral_quantization.default_model import AstralQuantizer
+        import yaml
+        
+        astral_config_path = config['model_params']['speech_tokenizer']['config_path']
+        astral_checkpoint_path = config['model_params']['speech_tokenizer']['checkpoint_path']
+        
+        # Load ASTRAL config
+        with open(astral_config_path, 'r') as f:
+            astral_config = yaml.safe_load(f)
+        
+        # Build ASTRAL model
+        from modules.astral_quantization.convnext import ConvNeXtV2Stage
+        from modules.astral_quantization.bsq import BinarySphericalQuantize
+        from modules.astral_quantization.asr_decoder import ASRDecoder
+        
+        # Filter out _target_ fields from configs
+        def filter_config(config_dict):
+            return {k: v for k, v in config_dict.items() if k != '_target_'}
+        
+        encoder_config = filter_config(astral_config['encoder'])
+        quantizer_config = filter_config(astral_config['quantizer'])
+        
+        encoder = ConvNeXtV2Stage(**encoder_config)
+        quantizer = BinarySphericalQuantize(**quantizer_config)
+        
+        # Create decoder and asr_decoder if specified in config
+        decoder = None
+        asr_decoder = None
+        
+        if 'decoder' in astral_config:
+            decoder_config = filter_config(astral_config['decoder'])
+            decoder = ConvNeXtV2Stage(**decoder_config)
+        
+        if 'asr_decoder' in astral_config:
+            asr_decoder_config = filter_config(astral_config['asr_decoder'])
+            asr_decoder = ASRDecoder(**asr_decoder_config)
+        
+        astral_model = AstralQuantizer(
+            tokenizer_name=astral_config['tokenizer_name'],
+            ssl_model_name=astral_config['ssl_model_name'],
+            ssl_output_layer=astral_config['ssl_output_layer'],
+            encoder=encoder,
+            quantizer=quantizer,
+            decoder=decoder,
+            asr_decoder=asr_decoder,
+            skip_ssl=False
+        )
+        
+        # Load checkpoint
+        astral_model.load_separate_checkpoint(astral_checkpoint_path)
+        astral_model.eval()
+        astral_model.to(device)
+        
+        # Create projection layer once, outside the function
+        projection_layer = torch.nn.Linear(512, 1024).to(device)
+        
+        def semantic_fn(waves_16k):
+            # Convert to proper format for ASTRAL
+            if len(waves_16k.shape) == 1:
+                waves_16k = waves_16k.unsqueeze(0)
+            
+            # Calculate lengths
+            wave_lengths = torch.LongTensor([waves_16k.size(-1)]).to(waves_16k.device)
+            
+            with torch.no_grad():
+                # Get quantized representations
+                x_quantized, indices, feature_lens = astral_model(waves_16k, wave_lengths)
+                
+                # Project from 512 to 1024 dimensions to match original Seed-VC expectations
+                if x_quantized.size(-1) == 512:
+                    x_quantized = projection_layer(x_quantized)
+                
+                return x_quantized
     else:
         raise ValueError(f"Unknown speech tokenizer type: {speech_tokenizer_type}")
     # Generate mel spectrograms
@@ -387,7 +463,7 @@ if __name__ == "__main__":
             self.sg_output_device: str = ""
             # Recording settings
             self.recording_enabled: bool = False
-            self.recording_file_path: str = "live_session.mp3"
+            self.recording_file_path: str = "output/recordings/live_session.mp3"
             self.recording_bitrate: int = 128
 
 
@@ -464,7 +540,10 @@ if __name__ == "__main__":
                         "diffusion_steps": 10,
                         "inference_cfg_rate": 0.7,
                         "max_prompt_length": 3.0,
-                    }
+                        "recording_enabled": False,
+                        "recording_file_path": "output/recordings/live_session.mp3",
+                        "recording_bitrate": 128,
+                     }
                     data["sr_model"] = data["sr_type"] == "sr_model"
                     data["sr_device"] = data["sr_type"] == "sr_device"
             return data
@@ -687,11 +766,11 @@ if __name__ == "__main__":
                             ],
                             [
                                 sg.Text("Recording File:"),
-                                sg.Input(
-                                    default_text=data.get("recording_file_path", "live_session.mp3"),
-                                    key="recording_file_path",
-                                    size=(30, 1),
-                                ),
+                                                                 sg.Input(
+                                     default_text=data.get("recording_file_path", "output/recordings/live_session.mp3"),
+                                     key="recording_file_path",
+                                     size=(30, 1),
+                                 ),
                                 sg.FileSaveAs(
                                     "Choose file",
                                     file_types=[("MP3 Files", "*.mp3")],
@@ -1073,17 +1152,24 @@ if __name__ == "__main__":
                     channels=1
                 )
                 
-                # Ensure directory exists
-                os.makedirs(os.path.dirname(self.gui_config.recording_file_path) or ".", exist_ok=True)
+                # Create timestamped filename
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                base_name = os.path.splitext(os.path.basename(self.gui_config.recording_file_path))[0]
+                output_dir = os.path.dirname(self.gui_config.recording_file_path)
+                timestamped_filename = f"{base_name}_{timestamp}.mp3"
+                full_output_path = os.path.join(output_dir, timestamped_filename)
+                
+                # Ensure output directory exists
+                os.makedirs(output_dir, exist_ok=True)
                 
                 # Export to MP3
                 audio_segment.export(
-                    self.gui_config.recording_file_path,
+                    full_output_path,
                     format="mp3",
                     bitrate=f"{self.gui_config.recording_bitrate}k"
                 )
                 
-                print(f"Recording saved to: {self.gui_config.recording_file_path}")
+                print(f"Recording saved to: {full_output_path}")
                 
             except Exception as e:
                 print(f"Error saving recording: {e}")
@@ -1330,8 +1416,8 @@ if __name__ == "__main__":
 
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to the model checkpoint")
-    parser.add_argument("--config-path", type=str, default=None, help="Path to the vocoder checkpoint")
+    parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to the Seed-VC model checkpoint")
+    parser.add_argument("--config-path", type=str, default=None, help="Path to the configuration file")
     parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True)
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()

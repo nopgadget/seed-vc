@@ -27,7 +27,7 @@ decoder:
   output_dim: 1024
   gin_channels: 192
 asr_decoder:
-  _target_: modules.asr_decoder.ASRDecoder
+  _target_: modules.astral_quantization.asr_decoder.ASRDecoder
   hidden_dim: 768
   num_heads: 12
   depth: 12
