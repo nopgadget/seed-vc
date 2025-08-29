@@ -365,7 +365,11 @@ def load_models(args):
         astral_model.to(device)
         
         # Create projection layer once, outside the function
-        projection_layer = torch.nn.Linear(512, 1024).to(device)
+        # ASTRAL outputs 384 dimensions, but length regulator expects 1024
+        projection_layer = torch.nn.Linear(384, 1024).to(device)
+        
+        # Also create a projection for 32 codebook if needed
+        projection_layer_32 = torch.nn.Linear(384, 1024).to(device)
         
         def semantic_fn(waves_16k):
             # Convert to proper format for ASTRAL
@@ -379,8 +383,12 @@ def load_models(args):
                 # Get quantized representations
                 x_quantized, indices, feature_lens = astral_model(waves_16k, wave_lengths)
                 
-                # Project from 512 to 1024 dimensions to match original Seed-VC expectations
-                if x_quantized.size(-1) == 512:
+                # Project from 384 to 1024 dimensions to match original Seed-VC expectations
+                if x_quantized.size(-1) == 384:
+                    x_quantized = projection_layer(x_quantized)
+                elif x_quantized.size(-1) != 1024:
+                    # Fallback for any other dimensions
+                    print(f"Warning: Unexpected ASTRAL output dimensions: {x_quantized.size(-1)}")
                     x_quantized = projection_layer(x_quantized)
                 
                 return x_quantized
