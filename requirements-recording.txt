@@ -1,0 +1,8 @@
+# Additional dependencies for continuous MP3 recording functionality
+pydub>=0.25.1
+pyaudio>=0.2.11
+
+# Note: pyaudio may require additional system dependencies on some platforms:
+# - Windows: Usually works with pip install
+# - macOS: brew install portaudio, then pip install pyaudio
+# - Linux: sudo apt-get install portaudio19-dev, then pip install pyaudio

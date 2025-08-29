@@ -14,6 +14,11 @@ sys.path.append(now_dir)
 import multiprocessing
 import warnings
 import yaml
+import wave
+import pyaudio
+from pydub import AudioSegment
+import threading
+import time
 
 warnings.simplefilter("ignore")
 
@@ -380,6 +385,10 @@ if __name__ == "__main__":
             self.wasapi_exclusive: bool = False
             self.sg_input_device: str = ""
             self.sg_output_device: str = ""
+            # Recording settings
+            self.recording_enabled: bool = False
+            self.recording_file_path: str = "live_session.mp3"
+            self.recording_bitrate: int = 128
 
 
     class GUI:
@@ -397,6 +406,10 @@ if __name__ == "__main__":
             self.model_set = load_models(args)
             from funasr import AutoModel
             self.vad_model = AutoModel(model="fsmn-vad", model_revision="v2.0.4")
+            # Recording variables
+            self.recording_buffer = []
+            self.recording_thread = None
+            self.recording_stop_event = threading.Event()
             self.update_devices()
             self.launcher()
 
@@ -662,6 +675,45 @@ if __name__ == "__main__":
                     ),
                 ],
                 [
+                    sg.Frame(
+                        layout=[
+                            [
+                                sg.Checkbox(
+                                    "Enable Continuous Recording",
+                                    key="recording_enabled",
+                                    default=data.get("recording_enabled", False),
+                                    enable_events=True,
+                                ),
+                            ],
+                            [
+                                sg.Text("Recording File:"),
+                                sg.Input(
+                                    default_text=data.get("recording_file_path", "live_session.mp3"),
+                                    key="recording_file_path",
+                                    size=(30, 1),
+                                ),
+                                sg.FileSaveAs(
+                                    "Choose file",
+                                    file_types=[("MP3 Files", "*.mp3")],
+                                    default_extension=".mp3",
+                                ),
+                            ],
+                            [
+                                sg.Text("MP3 Bitrate:"),
+                                sg.Combo(
+                                    ["64", "128", "192", "256", "320"],
+                                    key="recording_bitrate",
+                                    default_value=str(data.get("recording_bitrate", 128)),
+                                    size=(10, 1),
+                                    enable_events=True,
+                                ),
+                                sg.Text("kbps"),
+                            ],
+                        ],
+                        title="Recording Settings",
+                    ),
+                ],
+                [
                     sg.Button("Start Voice Conversion", key="start_vc"),
                     sg.Button("Stop Voice Conversion", key="stop_vc"),
                     sg.Radio(
@@ -742,6 +794,10 @@ if __name__ == "__main__":
                             "extra_time_ce": values["extra_time_ce"],
                             "extra_time": values["extra_time"],
                             "extra_time_right": values["extra_time_right"],
+                            # Recording settings
+                            "recording_enabled": values.get("recording_enabled", False),
+                            "recording_file_path": values.get("recording_file_path", "live_session.mp3"),
+                            "recording_bitrate": int(values.get("recording_bitrate", 128)),
                         }
                         with open("configs/inuse/config.json", "w") as j:
                             json.dump(settings, j)
@@ -764,6 +820,12 @@ if __name__ == "__main__":
                     self.gui_config.diffusion_steps = values["diffusion_steps"]
                 elif event == "inference_cfg_rate":
                     self.gui_config.inference_cfg_rate = values["inference_cfg_rate"]
+                elif event == "recording_enabled":
+                    self.gui_config.recording_enabled = values["recording_enabled"]
+                elif event == "recording_file_path":
+                    self.gui_config.recording_file_path = values["recording_file_path"]
+                elif event == "recording_bitrate":
+                    self.gui_config.recording_bitrate = int(values["recording_bitrate"])
                 elif event in ["vc", "im"]:
                     self.function = event
                 elif event == "stop_vc" or event != "start_vc":
@@ -799,6 +861,10 @@ if __name__ == "__main__":
             self.gui_config.extra_time_ce = values["extra_time_ce"]
             self.gui_config.extra_time = values["extra_time"]
             self.gui_config.extra_time_right = values["extra_time_right"]
+            # Recording settings
+            self.gui_config.recording_enabled = values.get("recording_enabled", False)
+            self.gui_config.recording_file_path = values.get("recording_file_path", "live_session.mp3")
+            self.gui_config.recording_bitrate = int(values.get("recording_bitrate", 128))
             return True
 
         def start_vc(self):
@@ -939,6 +1005,10 @@ if __name__ == "__main__":
                     extra_settings=extra_settings,
                 )
                 self.stream.start()
+                
+                # Start recording if enabled
+                if self.gui_config.recording_enabled:
+                    self.start_recording()
 
         def stop_stream(self):
             global flag_vc
@@ -948,6 +1018,88 @@ if __name__ == "__main__":
                     self.stream.abort()
                     self.stream.close()
                     self.stream = None
+                
+                # Stop recording if active
+                if self.gui_config.recording_enabled:
+                    self.stop_recording()
+
+        def start_recording(self):
+            """Start continuous MP3 recording of the live session"""
+            if not self.gui_config.recording_enabled:
+                return
+            
+            self.recording_stop_event.clear()
+            self.recording_buffer = []
+            self.recording_thread = threading.Thread(target=self._recording_worker)
+            self.recording_thread.daemon = True
+            self.recording_thread.start()
+            print(f"Started recording to: {self.gui_config.recording_file_path}")
+
+        def stop_recording(self):
+            """Stop continuous MP3 recording and save the file"""
+            if not self.gui_config.recording_enabled:
+                return
+            
+            self.recording_stop_event.set()
+            if self.recording_thread and self.recording_thread.is_alive():
+                self.recording_thread.join(timeout=5.0)
+            
+            if self.recording_buffer:
+                self._save_recording()
+            print("Recording stopped and saved")
+
+        def _recording_worker(self):
+            """Background thread for handling recording"""
+            while not self.recording_stop_event.is_set():
+                time.sleep(0.1)  # Small delay to prevent busy waiting
+
+        def _save_recording(self):
+            """Save the recorded audio buffer to MP3 file"""
+            try:
+                if not self.recording_buffer:
+                    return
+                
+                # Concatenate all audio chunks
+                combined_audio = np.concatenate(self.recording_buffer)
+                
+                # Convert to int16 format
+                audio_int16 = (combined_audio * 32768.0).astype(np.int16)
+                
+                # Create AudioSegment and export to MP3
+                audio_segment = AudioSegment(
+                    audio_int16.tobytes(),
+                    frame_rate=self.gui_config.samplerate,
+                    sample_width=audio_int16.dtype.itemsize,
+                    channels=1
+                )
+                
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(self.gui_config.recording_file_path) or ".", exist_ok=True)
+                
+                # Export to MP3
+                audio_segment.export(
+                    self.gui_config.recording_file_path,
+                    format="mp3",
+                    bitrate=f"{self.gui_config.recording_bitrate}k"
+                )
+                
+                print(f"Recording saved to: {self.gui_config.recording_file_path}")
+                
+            except Exception as e:
+                print(f"Error saving recording: {e}")
+
+        def add_to_recording(self, audio_chunk):
+            """Add an audio chunk to the recording buffer"""
+            if self.gui_config.recording_enabled and not self.recording_stop_event.is_set():
+                # Convert to numpy array if it's a tensor
+                if torch.is_tensor(audio_chunk):
+                    audio_chunk = audio_chunk.cpu().numpy()
+                
+                # Ensure it's a 1D array
+                if audio_chunk.ndim > 1:
+                    audio_chunk = audio_chunk.flatten()
+                
+                self.recording_buffer.append(audio_chunk)
 
         def audio_callback(
             self, indata: np.ndarray, outdata: np.ndarray, frames, times, status
@@ -1101,6 +1253,10 @@ if __name__ == "__main__":
                 .cpu()
                 .numpy()
             )
+            
+            # Add to recording buffer if recording is enabled
+            if self.gui_config.recording_enabled:
+                self.add_to_recording(infer_wav[: self.block_frame])
 
             total_time = time.perf_counter() - start_time
             if flag_vc:
