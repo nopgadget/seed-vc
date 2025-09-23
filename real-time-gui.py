@@ -1309,6 +1309,10 @@ if __name__ == "__main__":
                 infer_wav = self.input_wav[self.extra_frame :].clone()
 
             # SOLA algorithm from https://github.com/yxlllc/DDSP-SVC
+            # Ensure type consistency - convert to fp32 if needed
+            if infer_wav.dtype != self.sola_buffer.dtype:
+                infer_wav = infer_wav.float()
+            
             conv_input = infer_wav[
                 None, None, : self.sola_buffer_frame + self.sola_search_frame
             ]
