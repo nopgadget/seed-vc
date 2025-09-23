@@ -180,6 +180,28 @@ def load_models(args):
         model[key].eval()
         model[key].to(device)
     model.cfm.estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+    
+    # Compile models if requested
+    if args.compile:
+        if sys.platform == "win32":
+            print("Compiling model with torch.compile (enabled by default on Windows)...")
+        else:
+            print("Compiling model with torch.compile...")
+        torch._inductor.config.coordinate_descent_tuning = True
+        torch._inductor.config.triton.unique_kernel_names = True
+        
+        if hasattr(torch._inductor.config, "fx_graph_cache"):
+            # Experimental feature to reduce compilation times, will be on by default in future
+            torch._inductor.config.fx_graph_cache = True
+        
+        # Compile the CFM estimator transformer
+        model.cfm.estimator.transformer = torch.compile(
+            model.cfm.estimator.transformer,
+            fullgraph=True,
+            backend="inductor" if torch.cuda.is_available() else "aot_eager",
+            mode="reduce-overhead" if torch.cuda.is_available() else None,
+        )
+        print("Model compilation completed!")
 
     # Load additional modules
     from modules.campplus.DTDNN import CAMPPlus
@@ -1434,6 +1456,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to the Seed-VC model checkpoint")
     parser.add_argument("--config-path", type=str, default=None, help="Path to the configuration file")
     parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True)
+    parser.add_argument("--compile", action="store_true", default=sys.platform == "win32", help="Compile the model using torch.compile for faster inference (default: True on Windows)")
+    parser.add_argument("--no-compile", action="store_false", dest="compile", help="Disable compilation (overrides default)")
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
     cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda" 
