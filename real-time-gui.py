@@ -34,6 +34,10 @@ import os
 import sys
 import torch
 from modules.commons import str2bool
+
+# Add global error suppression for torch.dynamo to handle compilation issues gracefully
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 # Load model and configuration
 device = None
 
@@ -181,27 +185,62 @@ def load_models(args):
         model[key].to(device)
     model.cfm.estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
     
+    # Store original transformer for fallback
+    original_transformer = model.cfm.estimator.transformer
+    
     # Compile models if requested
-    if args.compile:
+    if args.compile and not args.disable_compile:
         if sys.platform == "win32":
             print("Compiling model with torch.compile (enabled by default on Windows)...")
         else:
             print("Compiling model with torch.compile...")
-        torch._inductor.config.coordinate_descent_tuning = True
-        torch._inductor.config.triton.unique_kernel_names = True
         
-        if hasattr(torch._inductor.config, "fx_graph_cache"):
-            # Experimental feature to reduce compilation times, will be on by default in future
-            torch._inductor.config.fx_graph_cache = True
-        
-        # Compile the CFM estimator transformer
-        model.cfm.estimator.transformer = torch.compile(
-            model.cfm.estimator.transformer,
-            fullgraph=True,
-            backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="reduce-overhead" if torch.cuda.is_available() else None,
-        )
-        print("Model compilation completed!")
+        try:
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            
+            if hasattr(torch._inductor.config, "fx_graph_cache"):
+                # Experimental feature to reduce compilation times, will be on by default in future
+                torch._inductor.config.fx_graph_cache = True
+            
+            # Compile the CFM estimator transformer with more conservative settings
+            try:
+                # Try a more conservative compilation approach first
+                compiled_transformer = torch.compile(
+                    original_transformer,
+                    fullgraph=False,  # More conservative: allow graph breaks
+                    backend="aot_eager",  # Use more stable backend
+                    mode=None,  # No optimization mode to avoid issues
+                )
+                model.cfm.estimator.transformer = compiled_transformer
+                print("Model compilation completed with conservative settings!")
+            except Exception as compile_error:
+                print(f"Warning: Conservative compilation failed: {compile_error}")
+                print("Trying even more basic compilation...")
+                try:
+                    # Try the most basic compilation possible
+                    compiled_transformer = torch.compile(
+                        original_transformer,
+                        backend="aot_eager",
+                    )
+                    model.cfm.estimator.transformer = compiled_transformer
+                    print("Basic compilation successful!")
+                except Exception as basic_error:
+                    print(f"Warning: All compilation attempts failed: {basic_error}")
+                    print("Falling back to eager execution (no compilation)")
+                    # Keep the original transformer without compilation
+                    model.cfm.estimator.transformer = original_transformer
+        except Exception as e:
+            print(f"Warning: Model compilation failed with error: {e}")
+            print("Falling back to eager execution (no compilation)")
+            print("If you continue to experience issues, try running with --no-compile or --disable-compile")
+            # Reset the transformer to its original state if compilation failed
+            # The model should still work without compilation
+    else:
+        if args.disable_compile:
+            print("Model compilation disabled by user request")
+        else:
+            print("Model compilation disabled (use --compile to enable)")
 
     # Load additional modules
     from modules.campplus.DTDNN import CAMPPlus
@@ -1458,6 +1497,7 @@ if __name__ == "__main__":
     parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True)
     parser.add_argument("--compile", action="store_true", default=sys.platform == "win32", help="Compile the model using torch.compile for faster inference (default: True on Windows)")
     parser.add_argument("--no-compile", action="store_false", dest="compile", help="Disable compilation (overrides default)")
+    parser.add_argument("--disable-compile", action="store_true", help="Force disable compilation to avoid potential compilation errors")
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
     cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda" 
