@@ -155,10 +155,13 @@ def load_models(args):
     fp16 = args.fp16
     print(f"Using fp16: {fp16}")
     if args.checkpoint_path is None or args.checkpoint_path == "":
-        # Use the most powerful model by default
-        dit_checkpoint_path = "checkpoints/models--Plachta--Seed-VC/snapshots/257283f9f41585055e8f858fba4fd044e5caed6e/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth"
-        dit_config_path = "checkpoints/models--Plachta--Seed-VC/snapshots/257283f9f41585055e8f858fba4fd044e5caed6e/config_dit_mel_seed_uvit_whisper_small_wavenet.yml"
+        # Use the most powerful model by default, download from HF if needed
         print("🚀 Using most powerful Seed-VC model by default!")
+        dit_checkpoint_path, dit_config_path = load_custom_model_from_hf(
+            "Plachta/Seed-VC",
+            "DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
+            "config_dit_mel_seed_uvit_whisper_small_wavenet.yml"
+        )
         print(f"   Model: {dit_checkpoint_path}")
         print(f"   Config: {dit_config_path}")
     else:
